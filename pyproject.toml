@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "antigravity-workshop-kit"
+version = "0.1.0"
+description = "CLI toolkit, templating engine, and agent skill for generating, testing, and exporting Google Cloud setup guides for Antigravity workshops."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+dependencies = [
+    "jinja2>=3.1.0",
+    "markdown>=3.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+]
+
+[project.scripts]
+antigravity-workshop-kit = "antigravity_workshop_kit.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+antigravity_workshop_kit = ["templates/*.j2", "templates/*.css"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

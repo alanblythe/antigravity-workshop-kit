@@ -1,0 +1,390 @@
+# {{ config.organization }} Antigravity Workshop: GCP Project & Client Setup Guide
+
+> **Audience:** {{ config.organization }} IT / GCP Project Administrators and Workshop Attendees.  
+> **Structure:** {{ config.team_count }} collaborative team{{ "s" if config.team_count != 1 else "" }} with one dedicated Google Cloud project per team.
+
+---
+
+## 1. Project Architecture ({{ config.team_count }} Team Project{{ "s" if config.team_count != 1 else "" }})
+
+Create **one dedicated Google Cloud project per workshop team** with billing attached. Each team project hosts {% if config.auth_mode == "vertex_paygo" %}**Vertex AI API access** (Pay-As-You-Go model inference){% else %}**Gemini Enterprise** (subscription-licensed model inference){% endif %}{% if config.enable_cloud_resources %} and **workload resource creation** (Cloud Run, Cloud Storage, Artifact Registry){% endif %}.
+
+{% for proj in team_projects -%}
+* `{{ proj }}`
+{% endfor %}
+
+---
+
+## 2. Administrator Setup: Project Creation, APIs & Guardrails
+
+Run the following commands as a GCP Organization / Project Administrator (requires `roles/resourcemanager.projectCreator` and `roles/billing.user`):
+
+### Step 0: Set Administrator Environment Variables
+Export configuration variables once in your terminal session before running provisioning steps:
+
+```bash
+# -----------------------------------------------------------------------------
+# Workshop Administrator Environment Variables
+# -----------------------------------------------------------------------------
+export BILLING_ACCOUNT_ID="{{ config.billing_account_id }}"
+export ORG_DOMAIN="{{ email_domain }}"
+export TEAM_COUNT={{ config.team_count }}
+export PROJECT_PREFIX="{{ config.project_prefix }}"
+export PROJECT_ID="{{ first_project_id }}"   # Default single-project target for individual operations
+{% if config.folder_id -%}
+export FOLDER_FLAG="--folder={{ config.folder_id }}"
+{% else -%}
+# export FOLDER_FLAG="--folder=<FOLDER_ID>"   # Uncomment if required by {{ config.organization }} Org Policy
+{% endif -%}
+```
+
+### Step 1: Create Projects & Link Billing
+```bash
+for N in $(seq 1 "${TEAM_COUNT:-{{ config.team_count }}}"); do
+  NN=$(printf "%02d" "${N}")
+  PROJECT_ID="{{ bash_project_id }}"
+  echo ">>> Creating project ${PROJECT_ID}..."
+  gcloud projects create "${PROJECT_ID}" \
+    --name="{{ config.organization }} AGY Team ${NN}" \
+    ${FOLDER_FLAG:-}
+
+  echo ">>> Linking billing account to ${PROJECT_ID}..."
+  gcloud billing projects link "${PROJECT_ID}" \
+    --billing-account="${BILLING_ACCOUNT_ID:-{{ config.billing_account_id }}}"
+done
+```
+
+### Step 2: Enable Required APIs
+Enable {% if config.auth_mode == "vertex_paygo" %}Vertex AI, {% endif %}Service Usage, Resource Manager, Gemini for Google Cloud{% if config.enable_cloud_resources %}, and workload deployment{% endif %} APIs:
+
+```bash
+for N in $(seq 1 "${TEAM_COUNT:-{{ config.team_count }}}"); do
+  NN=$(printf "%02d" "${N}")
+  PROJECT_ID="{{ bash_project_id }}"
+  echo ">>> Enabling APIs on ${PROJECT_ID}..."
+  gcloud services enable \
+{% if config.auth_mode == "vertex_paygo" %}    aiplatform.googleapis.com \
+{% endif %}    serviceusage.googleapis.com \
+    cloudresourcemanager.googleapis.com \
+    cloudaicompanion.googleapis.com \
+    billingbudgets.googleapis.com \
+    orgpolicy.googleapis.com{% if config.enable_cloud_resources %} \
+    run.googleapis.com \
+    artifactregistry.googleapis.com \
+    cloudbuild.googleapis.com \
+    storage.googleapis.com{% endif %} \
+    --project="${PROJECT_ID}"
+done
+```
+
+> **Note:** Enable only public Google Cloud service APIs (`aiplatform.googleapis.com` and `cloudaicompanion.googleapis.com`). Do not enable private or deprecated internal endpoints.
+
+### Step 3: Quota & Spend Guardrails
+
+#### A. Budget Alert Cap (Recommended Primary Guardrail)
+{% if config.auth_mode == "vertex_paygo" -%}
+Gemini 2.5 and Gemini 3.x models on Vertex AI utilize **Dynamic Shared Quota (DSQ)** on the `global` endpoint, where overall traffic allocation is dynamically managed. Set a Cloud Billing budget alert per team project to monitor spend:
+{% else -%}
+Set a Cloud Billing budget alert per team project to monitor cloud workload and API spend:
+{% endif %}
+
+```bash
+# Create a budget alert per team project (e.g. ${{ config.budget_alert_usd }} threshold)
+for N in $(seq 1 "${TEAM_COUNT:-{{ config.team_count }}}"); do
+  NN=$(printf "%02d" "${N}")
+  PROJECT_ID="{{ bash_project_id }}"
+  gcloud billing budgets create \
+    --billing-account="${BILLING_ACCOUNT_ID:-{{ config.billing_account_id }}}" \
+    --billing-project="${PROJECT_ID}" \
+    --display-name="Budget - {{ config.organization }} Workshop Team ${N}" \
+    --filter-projects="projects/${PROJECT_ID}" \
+    --budget-amount={{ config.budget_alert_usd }}USD \
+    --threshold-rule=percent=0.5 \
+    --threshold-rule=percent=0.8 \
+    --threshold-rule=percent=1.0 \
+    --threshold-rule=percent=1.0,basis=forecasted-spend
+done
+```
+
+{% if config.auth_mode == "vertex_paygo" -%}
+#### B. Consumer Rate Limit Overrides (Secondary Guardrail)
+To place rate limits on standard Vertex AI endpoints:
+
+1. **Regional Aggregate Online Prediction Cap:**
+   ```bash
+   for N in $(seq 1 "${TEAM_COUNT:-{{ config.team_count }}}"); do
+     NN=$(printf "%02d" "${N}")
+     PROJECT_ID="{{ bash_project_id }}"
+     gcloud alpha services quota create \
+       --service=aiplatform.googleapis.com \
+       --consumer="projects/${PROJECT_ID}" \
+       --metric="aiplatform.googleapis.com/online_prediction_requests" \
+       --unit="1/min/{project}/{region}" \
+       --dimensions=region={{ config.compute_region }} \
+       --value={{ config.rate_limit_rpm }} \
+       --force
+   done
+   ```
+2. **Per-Model Global Inference Cap:**
+   Overrides for `global_generate_content_requests_per_minute_per_project_per_base_model` can be applied via the Cloud Console:
+   * Navigate to **IAM & Admin ➔ Quotas & System Limits**.
+   * Filter Service: `Vertex AI API` ➔ Metric: `global_generate_content_requests`.
+   * Select the target base model and submit the consumer quota override (e.g., {{ config.rate_limit_rpm }} RPM).
+{% endif %}
+
+#### C. Restrict Allowed Models
+
+By default, all Vertex AI foundation models are accessible. **If you would like to restrict the models available to workshop attendees**, execute the script below to apply Google Cloud's Organization Policy constraint (`constraints/vertexai.allowedModels`). If you do not wish to enforce model restrictions, you can safely skip this step.
+
+This example configuration allowlists frontier reasoning and high-throughput workhorse models configured for Antigravity workflows:
+* **Google Models:** `Gemini 4 Argon` and `Gemini 3.8 Flash`
+* **Anthropic Partner Models:** `Claude Opus 5.5` and `Claude Sonnet 5.5`
+
+```bash
+# Create the allowed models policy definition
+cat << 'EOF' > /tmp/allowed_models_policy.yaml
+name: projects/${PROJECT_ID}/policies/vertexai.allowedModels
+spec:
+  rules:
+  - values:
+      allowedValues:
+{% for model in config.allowed_models %}      - {{ model }}
+{% endfor %}EOF
+
+# Enforce the allowed models constraint across all {{ config.team_count }} team projects
+for N in $(seq 1 "${TEAM_COUNT:-{{ config.team_count }}}"); do
+  NN=$(printf "%02d" "${N}")
+  PROJECT_ID="{{ bash_project_id }}"
+  echo ">>> Setting allowed models policy on ${PROJECT_ID}..."
+  sed "s/\${PROJECT_ID}/${PROJECT_ID}/g" /tmp/allowed_models_policy.yaml > "/tmp/policy_${PROJECT_ID}.yaml"
+  gcloud org-policies set-policy "/tmp/policy_${PROJECT_ID}.yaml" \
+    --billing-project="${PROJECT_ID}"
+done
+```
+
+> **Permission Prerequisite:** Applying organization policies via `gcloud org-policies set-policy` requires `roles/orgpolicy.policyAdmin` (Organization Policy Administrator) on the target project, folder, or organization.
+>
+> **Gemini Enterprise Subscriptions:** In subscription environments, partner models (such as Claude) can also be toggled centrally via the Google Cloud Console under **Gemini Enterprise ➔ Settings ➔ AI developer tools**.
+
+---
+
+## 3. Administrator Setup: IAM Roles & Team Permissions
+
+Grant team members the required roles on their team's project.
+
+### Role Requirements per Attendee
+
+| Permission Need | Role Name | Role Identifier | Purpose |
+| :--- | :--- | :--- | :--- |
+{% if config.auth_mode == "vertex_paygo" -%}
+| **Model Inference** | Vertex AI User | `roles/aiplatform.user` | Invokes Gemini models on Vertex AI (`aiplatform.endpoints.predict`). |
+| **Project Billing / Quota** | Service Usage Consumer | `roles/serviceusage.serviceUsageConsumer` | Authorizes API consumption and bills usage to the project. |
+{% else -%}
+| **Gemini Enterprise Access** | Gemini for Google Cloud User | `roles/cloudaicompanion.user` | Authorizes subscription-backed Gemini Enterprise assistance in the project. |
+| **Project Billing / Quota** | Service Usage Consumer | `roles/serviceusage.serviceUsageConsumer` | Authorizes API consumption and project service checks. |
+{% endif -%}
+{% if config.enable_cloud_resources -%}
+| **Resource Creation** | Project Editor | `roles/editor` | Builds and deploys services (Cloud Run, Cloud Storage, Artifact Registry, Cloud Build). |
+{% endif %}
+{% if config.auth_mode == "gemini_enterprise" %}
+> **Subscription Seat Assignment:** Ensure each attendee or team Google Group (`{{ first_group_email }}` .. `{{ last_group_email }}`) has an active **Gemini Enterprise** license seat assigned via Google Admin Console or the Google Cloud Gemini Admin panel.
+{% endif -%}
+{% if config.enable_cloud_resources %}
+> **Least-Privilege Alternative:** If security policy restricts granting `roles/editor`, administrators can grant the following scoped roles instead:
+> * `roles/run.admin` (Cloud Run management)
+> * `roles/iam.serviceAccountUser` (Mandatory: authorizes Cloud Run to run as the Compute service account)
+> * `roles/cloudbuild.builds.editor` (Mandatory for deploying Cloud Run services from source)
+> * `roles/storage.admin` (Cloud Storage buckets & objects)
+> * `roles/artifactregistry.admin` (Container images)
+> * `roles/logging.viewer` (Build and service log inspection)
+{% endif %}
+
+### Step 4: Team Google Groups & IAM Permissions
+
+#### Option A: Team Google Groups (Recommended for Teams)
+
+##### 1. Automated Group Creation via CLI (Optional)
+If your administrator account holds **Groups Admin** privileges in Google Workspace or Cloud Identity (`roles/cloudidentity.groupsAdmin`), you can automatically provision all {{ config.team_count }} team Google Groups:
+
+```bash
+# Set your Cloud Identity domain or Organization ID (e.g. {{ email_domain }})
+ORG_DOMAIN="${ORG_DOMAIN:-{{ email_domain }}}"
+
+for N in $(seq 1 "${TEAM_COUNT:-{{ config.team_count }}}"); do
+  NN=$(printf "%02d" "${N}")
+  GROUP_EMAIL="{{ bash_group_email }}"
+  echo ">>> Creating team group ${GROUP_EMAIL}..."
+  gcloud identity groups create "${GROUP_EMAIL}" \
+    --organization="${ORG_DOMAIN}" \
+    --display-name="{{ config.organization }} Workshop Team ${N}" \
+    --description="Antigravity workshop attendee group for Team ${N}"
+done
+```
+
+> **Manual Alternative:** If your account lacks Cloud Identity organization permissions, request your Workspace administrator create these groups in the [Google Workspace Admin Console](https://admin.google.com) (**Directory ➔ Groups ➔ Create group**).
+
+##### 2. Bind Project IAM Roles to Team Groups
+Once the groups exist, bind the necessary roles across all {{ config.team_count }} team projects:
+
+```bash
+for N in $(seq 1 "${TEAM_COUNT:-{{ config.team_count }}}"); do
+  NN=$(printf "%02d" "${N}")
+  PROJECT_ID="{{ bash_project_id }}"
+  GROUP_EMAIL="{{ bash_group_email }}"
+
+{% if config.auth_mode == "vertex_paygo" %}  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="group:${GROUP_EMAIL}" \
+    --role="roles/aiplatform.user"
+{% else %}  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="group:${GROUP_EMAIL}" \
+    --role="roles/cloudaicompanion.user"
+{% endif %}
+  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="group:${GROUP_EMAIL}" \
+    --role="roles/serviceusage.serviceUsageConsumer"
+{% if config.enable_cloud_resources %}
+  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="group:${GROUP_EMAIL}" \
+    --role="roles/editor"
+{% endif %}done
+```
+
+#### Option B: Individual Attendee Grants (Direct User Binding)
+
+```bash
+# Example for individual user on Team N:
+PROJECT_ID="${PROJECT_ID:-{{ first_project_id }}}"
+ATTENDEE_EMAIL="attendee@${ORG_DOMAIN:-{{ email_domain }}}"
+
+{% if config.auth_mode == "vertex_paygo" -%}
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="user:${ATTENDEE_EMAIL}" \
+  --role="roles/aiplatform.user"
+{% else -%}
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="user:${ATTENDEE_EMAIL}" \
+  --role="roles/cloudaicompanion.user"
+{% endif %}
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="user:${ATTENDEE_EMAIL}" \
+  --role="roles/serviceusage.serviceUsageConsumer"
+{% if config.enable_cloud_resources %}
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="user:${ATTENDEE_EMAIL}" \
+  --role="roles/editor"
+{% endif -%}
+```
+
+---
+
+## 4. Attendee Setup: Antigravity Client Sign-In
+
+Attendees must connect Antigravity to their assigned team project using the {% if config.auth_mode == "vertex_paygo" %}Pay-As-You-Go{% else %}Subscription (Gemini Enterprise){% endif %} option.
+
+### Method A: Antigravity Desktop App & IDE Extensions (VS Code, JetBrains, Zed)
+
+```
+Settings ➔ Account ➔ Sign In ➔ Use business account ➔ Continue with Google Cloud
+```
+
+1. Open **Settings ➔ Account** in Antigravity (or IDE extension) and click **Sign In**.
+2. Click **“Use business account”**.  
+   *(Do **NOT** click "Continue with Google" — that invokes consumer login).*
+3. Click **“Continue with Google Cloud”** and authenticate with your corporate Google credentials in your browser.
+4. On the **Select Billing Model** screen:
+{% if config.auth_mode == "vertex_paygo" %}   * Select **“Pay As You Go”** (*"Pay only for the tokens you use, billed through Gemini platform"*).
+   * *(Do **NOT** select "Subscription" — no seat licenses are assigned).*
+{% else %}   * Select **“Subscription”** (*Gemini Enterprise seat license*).
+{% endif %}5. On the **Provide Google Cloud Project** screen:
+   * Enter your assigned team project ID: `{{ project_placeholder }}`.
+   * Click **Next**.
+6. On the **Choose Region** screen:
+   * Select **`{{ config.region | capitalize }}`** and click **Next**.  
+   > [!IMPORTANT]
+   > You **MUST** select **`Global`**. Do **NOT** select `United States` or `Europe`. Antigravity's Gemini models are served from `locations/global`; regional selections will return HTTP 404 errors.
+7. Accept the **Terms of Service & Data Use** and click **“Get started”**.
+
+*(Note for older Antigravity clients v1.4.x: If prompted for Project ID before Billing Model, enter `{{ project_placeholder }}`, select `Global`, and choose `{% if config.auth_mode == "vertex_paygo" %}Agent Platform - Pay as you go{% else %}Gemini Enterprise - Subscription{% endif %}` on the fallback screen).*
+
+---
+
+### Method B: Antigravity CLI (`agy`)
+
+1. Open your terminal and run:
+   ```bash
+   agy
+   ```
+2. At `Select login method:`, select:
+   ```text
+   > 2. Use a Google Cloud project
+   ```
+   *(Do NOT select `1. Google OAuth`).*
+3. At `Select Google Cloud sign-in method:`, select:
+   ```text
+   > 1. Continue with Google Cloud
+   ```
+   * Complete authentication in your browser. (If the link in your terminal wraps across lines, click the `→ Click here to authenticate` hyperlink directly or widen your terminal window).
+4. At `Select billing model:`, select:
+{% if config.auth_mode == "vertex_paygo" %}   ```text
+   > 2. Pay As You Go – Pay only for the tokens you use, billed through Gemini platform.
+   ```
+{% else %}   ```text
+   > 1. Subscription – Use your assigned Gemini Enterprise seat license.
+   ```
+{% endif %}5. At `Provide Google Cloud project:`, enter your assigned team project:
+   ```text
+   {{ project_placeholder }}
+   ```
+6. At `Choose region:`, select:
+   ```text
+   > {{ config.region }}
+   ```
+7. At `Do you trust the contents of this project?`, select `Yes, I trust this folder`.
+
+---
+
+## 5. Attendee Setup: Terminal `gcloud` & Application Default Credentials (ADC)
+
+To deploy cloud resources (Cloud Run, Cloud Storage) from the terminal, build scripts, or agent tools:
+
+```bash
+# 1. Set your assigned team project ID
+PROJECT_ID="{{ first_project_id }}"   # Replace with your assigned team project (e.g. {{ first_project_id }} .. {{ last_project_id }})
+
+# 2. Authenticate gcloud CLI and Application Default Credentials (ADC) in a single browser login
+gcloud auth login --update-adc
+
+# 3. Set default project and ADC quota project to your assigned team project
+gcloud config set project "${PROJECT_ID}"
+gcloud auth application-default set-quota-project "${PROJECT_ID}"
+
+# 4. Set default compute region for Cloud Run
+gcloud config set compute/region {{ config.compute_region }}
+```
+
+---
+
+## 6. Pre-Flight Verification Smoke Test
+
+Run these two verification checks before the workshop:
+
+### Test 1: Verify Antigravity Model Inference
+In the Antigravity chat window, run:
+```text
+Explain the purpose of an MCP server in 2 sentences.
+```
+* **Success:** Streaming response generates with zero quota or permission errors.
+
+### Test 2: Verify Cloud Project & Resource Permissions
+In your terminal, verify project and service access:
+```bash
+# Verify using your configured team project
+PROJECT_ID="${PROJECT_ID:-{{ first_project_id }}}"
+
+{% if config.enable_cloud_resources -%}
+gcloud run services list --project="${PROJECT_ID}"
+{% else -%}
+gcloud projects describe "${PROJECT_ID}" --format="value(projectId)"
+{% endif -%}
+```
+* **Success:** Command returns active resource output with zero permission errors.

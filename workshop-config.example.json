@@ -1,0 +1,22 @@
+{
+  "organization": "Workshop",
+  "auth_mode": "vertex_paygo",
+  "team_count": 5,
+  "project_prefix": "workshop-team",
+  "billing_account_id": "<BILLING_ACCOUNT_ID>",
+  "folder_id": "",
+  "region": "global",
+  "compute_region": "us-central1",
+  "budget_alert_usd": 250,
+  "rate_limit_rpm": 150,
+  "group_email_pattern": "agy-workshop-team{NN}@example.com",
+  "enable_cloud_resources": true,
+  "enable_model_restrictions": true,
+  "allowed_models": [
+    "publishers/google/models/gemini-4-argon:predict",
+    "publishers/google/models/gemini-3.8-flash:predict",
+    "publishers/anthropic/models/claude-opus-5.5:predict",
+    "publishers/anthropic/models/claude-sonnet-5.5:predict"
+  ],
+  "output_filename": "antigravity_setup_guide.md"
+}
